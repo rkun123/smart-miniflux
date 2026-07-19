@@ -74,10 +74,8 @@ func getEnvInt(key string, fallback int) int {
 
 // MinifluxのWebhookから届くペイロードの構造
 type MinifluxWebhook struct {
-	EventType string `json:"event_type"`
-	EventData struct {
-		Entries []MinifluxEntry `json:"entries"`
-	} `json:"event_data"`
+	EventType string          `json:"event_type"`
+	Entries   []MinifluxEntry `json:"entries"`
 }
 
 type MinifluxEntry struct {
@@ -116,16 +114,13 @@ type LLMOutput struct {
 
 // Minifluxへのインサート用構造
 type MinifluxInsertPayload struct {
-	FeedID  int64              `json:"feed_id"`
-	Entries []MinifluxNewEntry `json:"entries"`
-}
-
-type MinifluxNewEntry struct {
-	Hash    string `json:"hash"`
-	Title   string `json:"title"`
-	Status  string `json:"status"`
-	URL     string `json:"url"`
-	Content string `json:"content"`
+	Title       string   `json:"title"`
+	URL         string   `json:"url"`
+	Author      string   `json:"author"`
+	Content     string   `json:"content"`
+	PublishedAt int64    `json:"published_at"`
+	Status      string   `json:"status"`
+	Tags        []string `json:"tags"`
 }
 
 // ==========================================
@@ -264,30 +259,34 @@ func processArticleWithLLM(entry MinifluxEntry) {
 
 	// 2. スコアが閾値以上なら新規インサート
 	if output.Score >= ScoreThreshold {
-		formattedHTML := fmt.Sprintf(
-			"<div style='background-color: #f0f7ff; padding: 15px; border-left: 5px solid #0066cc; margin-bottom: 20px;'>"+
-				"<strong>🤖 AIによる要約 (Score: %d/10)</strong><br>%s"+
-				"</div><hr><h3>📝 日本語訳本文</h3>%s",
+		formattedHTML := fmt.Sprintf(`
+			<div style='background-color: #f0f7ff; padding: 15px; border-left: 5px solid #0066cc; margin-bottom: 20px; border: black 1px;'>
+				<h3>🤖 AIによる要約 (Score: %d/10)</h3><br>
+				<p>%s</p>
+				<h3>📝 推薦文</h3><br>
+				<p>%s</p>
+				<br>
+			</div>
+				%s
+			`,
 			output.Score,
 			strings.ReplaceAll(output.SummaryJa, "\n", "<br>"),
 			strings.ReplaceAll(output.Comment, "\n", "<br>"),
+			entry.Content,
 		)
 
 		insertPayload := MinifluxInsertPayload{
-			FeedID: AIFeedID,
-			Entries: []MinifluxNewEntry{
-				{
-					Hash:    fmt.Sprintf("ai-trans-%d", entry.ID),
-					Title:   fmt.Sprintf("[★%d] %s", output.Score, output.TitleJa),
-					Status:  "unread",
-					URL:     entry.URL,
-					Content: formattedHTML,
-				},
-			},
+			Title:       fmt.Sprintf("[★%d] %s", output.Score, output.TitleJa),
+			Status:      "unread",
+			URL:         entry.URL,
+			Author:      "SmartMiniflux",
+			PublishedAt: time.Now().Unix(),
+			Content:     formattedHTML,
+			Tags:        []string{"smart"},
 		}
 
 		insertBody, _ := json.Marshal(insertPayload)
-		insertURL := fmt.Sprintf("%s/v1/feeds/%d/entries", MinifluxURL, AIFeedID)
+		insertURL := fmt.Sprintf("%s/v1/feeds/%d/entries/import", MinifluxURL, AIFeedID)
 
 		req, _ := http.NewRequest("POST", insertURL, bytes.NewBuffer(insertBody))
 		req.Header.Set("X-Auth-Token", MinifluxAPIKey)
@@ -351,8 +350,10 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if webhook.EventType == "entries.save" {
-		for _, entry := range webhook.EventData.Entries {
+	log.Printf("body: %+v", webhook)
+
+	if webhook.EventType == "new_entries" {
+		for _, entry := range webhook.Entries {
 			// 無限ループ防止: スクリプト自身が書き込んだAIフィードの記事はスキップする
 			if entry.FeedID == AIFeedID {
 				continue
