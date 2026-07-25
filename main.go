@@ -27,6 +27,9 @@ var (
 	LLMModelName   = getEnv("LLM_MODEL_NAME", "Gemma-4-E2B-it")
 	ScoreThreshold = getEnvInt("SCORE_THRESHOLD", 5)
 	LLMRetryCount  = getEnvInt("LLM_RETRY_COUNT", 2)
+
+	// LLMリクエストをシリアル化するためのチャネル
+	entryChan = make(chan MinifluxEntry, 100)
 )
 
 // ------------------------------------------
@@ -191,7 +194,16 @@ func checkLatestEntryOnStart() {
 }
 
 // ==========================================
-// 🧠 LLM推論＆Minifluxインサートロジック (Goroutineで実行)
+// 🧵 LLMリクエストをシリアルに処理するワーカー
+// ==========================================
+func entryWorker() {
+	for entry := range entryChan {
+		processArticleWithLLM(entry)
+	}
+}
+
+// ==========================================
+// 🧠 LLM推論＆Minifluxインサートロジック
 // ==========================================
 func processArticleWithLLM(entry MinifluxEntry) {
 	log.Printf("Processing item: %s", entry.Title)
@@ -376,6 +388,10 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("body: %+v", webhook)
 
+	// Minifluxに即座に応答を返す（タイムアウト防止）
+	w.WriteHeader(http.StatusAccepted)
+	w.Write([]byte(`{"status":"accepted"}`))
+
 	if webhook.EventType == "new_entries" {
 		for _, entry := range webhook.Entries {
 			// 無限ループ防止: スクリプト自身が書き込んだAIフィードの記事はスキップする
@@ -383,17 +399,16 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// ★ Goの本領発揮
-			go processArticleWithLLM(entry)
+			// チャネルに送信してシリアル処理（entryWorkerが逐次処理する）
+			entryChan <- entry
 		}
 	}
-
-	// Minifluxに即座に応答を返す（タイムアウト防止）
-	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(`{"status":"accepted"}`))
 }
 
 func main() {
+	// LLMリクエストをシリアルに処理するワーカーを起動
+	go entryWorker()
+
 	checkLatestEntryOnStart()
 	http.HandleFunc("/webhook", handleWebhook)
 	log.Println("Starting server on :8000...")
