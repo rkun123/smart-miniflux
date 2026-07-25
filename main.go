@@ -186,7 +186,7 @@ func checkLatestEntryOnStart() {
 
 	// すでに処理済み（タイトルに [★ がついているなど）でなければ、LLM処理を走らせる
 	// ※ただし、今回は新規記事として別フィードに入れるので、元記事のタイトルに [★ はないはずですが安全のため
-	go processArticleWithLLM(latestEntry)
+	processArticleWithLLM(latestEntry)
 }
 
 // ==========================================
