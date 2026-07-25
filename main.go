@@ -257,31 +257,17 @@ func processArticleWithLLM(entry MinifluxEntry) {
 
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	// 2. スコアが閾値以上なら新規インサート
+	// 2. スコアが閾値以上なら新規インサート（タイトルのみ変更、本文は元記事のまま）
 	if output.Score >= ScoreThreshold {
-		formattedHTML := fmt.Sprintf(`
-			<div style='background-color: #f0f7ff; padding: 15px; border-left: 5px solid #0066cc; margin-bottom: 20px; border: black 1px;'>
-				<h3>🤖 AIによる要約 (Score: %d/10)</h3><br>
-				<p>%s</p>
-				<h3>📝 推薦文</h3><br>
-				<p>%s</p>
-				<br>
-			</div>
-				%s
-			`,
-			output.Score,
-			strings.ReplaceAll(output.SummaryJa, "\n", "<br>"),
-			strings.ReplaceAll(output.Comment, "\n", "<br>"),
-			entry.Content,
-		)
+		newTitle := fmt.Sprintf("[★%d] %s", output.Score, output.TitleJa)
 
 		insertPayload := MinifluxInsertPayload{
-			Title:       fmt.Sprintf("[★%d] %s", output.Score, output.TitleJa),
+			Title:       newTitle,
 			Status:      "unread",
 			URL:         entry.URL,
 			Author:      "SmartMiniflux",
 			PublishedAt: time.Now().Unix(),
-			Content:     formattedHTML,
+			Content:     entry.Content, // 元記事の本文をそのまま使用
 			Tags:        []string{"smart"},
 		}
 
@@ -297,16 +283,17 @@ func processArticleWithLLM(entry MinifluxEntry) {
 			log.Printf("Failed to insert entry into Miniflux: %v", err)
 		} else {
 			insResp.Body.Close()
-			log.Printf("成功: 新しい翻訳記事をインサートしました。")
+			log.Printf("成功: タイトルを変更した記事をインサートしました。")
 		}
-		// ★ 2. Discord Webhook への通知処理を追加
+
+		// ★ Discord Webhook への通知処理
 		discordPayload := DiscordPayload{
 			Embeds: []DiscordEmbed{
 				{
-					Title:       fmt.Sprintf("[★%d] %s", output.Score, output.TitleJa),
+					Title:       newTitle,
 					Description: fmt.Sprintf("**🤖 AI要約**\n%s", output.SummaryJa),
-					URL:         entry.URL, // タイトルをクリックしたときに元記事に飛べるリンク
-					Color:       3447003,   // 埋め込みの左端の線の色（鮮やかな青色）
+					URL:         entry.URL,
+					Color:       3447003,
 					Timestamp:   time.Now().Format(time.RFC3339),
 					Fields: []DiscordField{
 						{
