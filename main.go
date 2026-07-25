@@ -26,6 +26,7 @@ var (
 	LLMServerURL   = getEnv("LLM_SERVER_URL", "http://192.168.0.14:8000/v1/chat/completions")
 	LLMModelName   = getEnv("LLM_MODEL_NAME", "Gemma-4-E2B-it")
 	ScoreThreshold = getEnvInt("SCORE_THRESHOLD", 5)
+	LLMRetryCount  = getEnvInt("LLM_RETRY_COUNT", 2)
 )
 
 // ------------------------------------------
@@ -227,29 +228,52 @@ func processArticleWithLLM(entry MinifluxEntry) {
 
 	reqBody, _ := json.Marshal(llmReq)
 
-	// 1. ローカルLLMサーバーへポスト
-	resp, err := http.Post(LLMServerURL, "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		log.Printf("LLM Server Error: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	var llmResp LLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		log.Printf("Failed to decode LLM response: %v", err)
-		return
-	}
-
-	// マークダウンの ```json を削るトリミング処理
-	rawJSON := llmResp.Choices[0].Message.Content
-	rawJSON = strings.TrimPrefix(rawJSON, "```json")
-	rawJSON = strings.TrimSuffix(rawJSON, "```")
-	rawJSON = strings.TrimSpace(rawJSON)
-
 	var output LLMOutput
-	if err := json.Unmarshal([]byte(rawJSON), &output); err != nil {
-		log.Printf("Failed to parse LLM Output JSON: %v", err)
+	var lastErr error
+
+	// リトライループ: LLMリクエスト〜JSONパースまでをリトライ
+	for i := 0; i <= LLMRetryCount; i++ {
+		if i > 0 {
+			log.Printf("LLMリクエスト リトライ %d/%d", i, LLMRetryCount)
+			time.Sleep(1 * time.Second)
+		}
+
+		// 1. ローカルLLMサーバーへポスト
+		resp, err := http.Post(LLMServerURL, "application/json", bytes.NewBuffer(reqBody))
+		if err != nil {
+			lastErr = fmt.Errorf("LLM Server Error: %w", err)
+			log.Printf("LLM Server Error (attempt %d/%d): %v", i, LLMRetryCount, err)
+			continue
+		}
+
+		var llmResp LLMResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&llmResp)
+		resp.Body.Close()
+		if decodeErr != nil {
+			lastErr = fmt.Errorf("Failed to decode LLM response: %w", decodeErr)
+			log.Printf("Failed to decode LLM response (attempt %d/%d): %v", i, LLMRetryCount, decodeErr)
+			continue
+		}
+
+		// マークダウンの ```json を削るトリミング処理
+		rawJSON := llmResp.Choices[0].Message.Content
+		rawJSON = strings.TrimPrefix(rawJSON, "```json")
+		rawJSON = strings.TrimSuffix(rawJSON, "```")
+		rawJSON = strings.TrimSpace(rawJSON)
+
+		if err := json.Unmarshal([]byte(rawJSON), &output); err != nil {
+			lastErr = fmt.Errorf("Failed to parse LLM Output JSON: %w", err)
+			log.Printf("Failed to parse LLM Output JSON (attempt %d/%d): %v", i, LLMRetryCount, err)
+			continue
+		}
+
+		// 成功
+		lastErr = nil
+		break
+	}
+
+	if lastErr != nil {
+		log.Printf("LLM処理がすべてのリトライに失敗しました: %v", lastErr)
 		return
 	}
 
