@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +28,7 @@ var (
 	LLMModelName   = getEnv("LLM_MODEL_NAME", "Gemma-4-E2B-it")
 	ScoreThreshold = getEnvInt("SCORE_THRESHOLD", 5)
 	LLMRetryCount  = getEnvInt("LLM_RETRY_COUNT", 2)
+	SystemPrompt   = getEnv("SYSTEM_PROMPT", `あなたは優秀なニュースキュレーターです。"rkun"という人物のためにニュースを選別して届けます。`)
 
 	// LLMリクエストをシリアル化するためのチャネル
 	entryChan = make(chan MinifluxEntry, 100)
@@ -208,24 +210,19 @@ func entryWorker() {
 func processArticleWithLLM(entry MinifluxEntry) {
 	log.Printf("Processing item: %s", entry.Title)
 
-	// ★ バッククォート（`）を使用することで、複数行をそのまま記述できます
-	systemPrompt := `
-	あなたは優秀なニュースキュレーターです。"rkun"という人物のためにニュースを選別して届けます。
-	rkunは以下の趣味嗜好を持っています。
-	- Webのエンジニアで最先端のWebやクラウドインフラ技術に興味があります。
-	- ギークなガジェットにも興味があり、電子工作などDIYにも関心があります。
-	- 自動車も好きで、特に古い日本車のスポーツカーやSUVが好みです。最新の電気自動車の話題にも興味があります。彼の愛車はインプレッサWRXです。
-	- 日本の政治経済の最新の動きについても関心があります。
-	- 暗号通貨、特にステーブルコインに興味があります。暗号通貨の為替については余り関心がありません。
-	記事を日本語で要約し、rkunが読む価値があるかについて1から10のスコアを付けてください。
-	必ず以下のJSON形式のみで回答してください。他のテキストや説明は一切含めないでください。"
+	// システムプロンプトは環境変数 SYSTEM_PROMPT から取得（未設定時はデフォルト値）
+	// JSONスキーマの指示はコード側で自動的に末尾に追加する
+	systemPrompt := SystemPrompt + `
 
-	{
-	  "score": 8,
-	  "title_ja": "[タイトル]",
-	  "summary_ja": "[3行程度の日本語の要約文]",
-	  "comment": "[どうしてrkunが読むべき記事なのかの理由]"
-	}`
+記事を日本語で要約し、rkunが読む価値があるかについて1から10のスコアを付けてください。
+必ず以下のJSON形式のみで回答してください。他のテキストや説明は一切含めないでください。"
+
+{
+  "score": 8,
+  "title_ja": "[タイトル]",
+  "summary_ja": "[3行程度の日本語の要約文]",
+  "comment": "[どうしてrkunが読むべき記事なのかの理由]"
+}`
 
 	userContent := fmt.Sprintf("Title: %s\n\nContent: %s", entry.Title, entry.Content)
 
@@ -258,12 +255,19 @@ func processArticleWithLLM(entry MinifluxEntry) {
 			continue
 		}
 
-		var llmResp LLMResponse
-		decodeErr := json.NewDecoder(resp.Body).Decode(&llmResp)
+		bodyBytes, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if decodeErr != nil {
+		if readErr != nil {
+			lastErr = fmt.Errorf("Failed to read LLM response body: %w", readErr)
+			log.Printf("Failed to read LLM response body (attempt %d/%d): %v", i, LLMRetryCount, readErr)
+			continue
+		}
+
+		var llmResp LLMResponse
+		if decodeErr := json.Unmarshal(bodyBytes, &llmResp); decodeErr != nil {
 			lastErr = fmt.Errorf("Failed to decode LLM response: %w", decodeErr)
 			log.Printf("Failed to decode LLM response (attempt %d/%d): %v", i, LLMRetryCount, decodeErr)
+			log.Printf("LLM raw response (attempt %d/%d): %s", i, LLMRetryCount, string(bodyBytes))
 			continue
 		}
 
@@ -276,6 +280,7 @@ func processArticleWithLLM(entry MinifluxEntry) {
 		if err := json.Unmarshal([]byte(rawJSON), &output); err != nil {
 			lastErr = fmt.Errorf("Failed to parse LLM Output JSON: %w", err)
 			log.Printf("Failed to parse LLM Output JSON (attempt %d/%d): %v", i, LLMRetryCount, err)
+			log.Printf("LLM raw response (attempt %d/%d): %s", i, LLMRetryCount, string(bodyBytes))
 			continue
 		}
 
