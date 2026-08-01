@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -26,6 +27,11 @@ var (
 	LLMServerURL   = getEnv("LLM_SERVER_URL", "http://192.168.0.14:8000/v1/chat/completions")
 	LLMModelName   = getEnv("LLM_MODEL_NAME", "Gemma-4-E2B-it")
 	ScoreThreshold = getEnvInt("SCORE_THRESHOLD", 5)
+	LLMRetryCount  = getEnvInt("LLM_RETRY_COUNT", 2)
+	SystemPrompt   = getEnv("SYSTEM_PROMPT", `あなたは優秀なニュースキュレーターです。"rkun"という人物のためにニュースを選別して届けます。`)
+
+	// LLMリクエストをシリアル化するためのチャネル
+	entryChan = make(chan MinifluxEntry, 100)
 )
 
 // ------------------------------------------
@@ -186,33 +192,37 @@ func checkLatestEntryOnStart() {
 
 	// すでに処理済み（タイトルに [★ がついているなど）でなければ、LLM処理を走らせる
 	// ※ただし、今回は新規記事として別フィードに入れるので、元記事のタイトルに [★ はないはずですが安全のため
-	go processArticleWithLLM(latestEntry)
+	processArticleWithLLM(latestEntry)
 }
 
 // ==========================================
-// 🧠 LLM推論＆Minifluxインサートロジック (Goroutineで実行)
+// 🧵 LLMリクエストをシリアルに処理するワーカー
+// ==========================================
+func entryWorker() {
+	for entry := range entryChan {
+		processArticleWithLLM(entry)
+	}
+}
+
+// ==========================================
+// 🧠 LLM推論＆Minifluxインサートロジック
 // ==========================================
 func processArticleWithLLM(entry MinifluxEntry) {
 	log.Printf("Processing item: %s", entry.Title)
 
-	// ★ バッククォート（`）を使用することで、複数行をそのまま記述できます
-	systemPrompt := `
-	あなたは優秀なニュースキュレーターです。"rkun"という人物のためにニュースを選別して届けます。
-	rkunは以下の趣味嗜好を持っています。
-	- Webのエンジニアで最先端のWebやクラウドインフラ技術に興味があります。
-	- ギークなガジェットにも興味があり、電子工作などDIYにも関心があります。
-	- 自動車も好きで、特に古い日本車のスポーツカーやSUVが好みです。最新の電気自動車の話題にも興味があります。彼の愛車はインプレッサWRXです。
-	- 日本の政治経済の最新の動きについても関心があります。
-	- 暗号通貨、特にステーブルコインに興味があります。暗号通貨の為替については余り関心がありません。
-	記事を日本語で要約し、rkunが読む価値があるかについて1から10のスコアを付けてください。
-	必ず以下のJSON形式のみで回答してください。他のテキストや説明は一切含めないでください。"
+	// システムプロンプトは環境変数 SYSTEM_PROMPT から取得（未設定時はデフォルト値）
+	// JSONスキーマの指示はコード側で自動的に末尾に追加する
+	systemPrompt := SystemPrompt + `
 
-	{
-	  "score": 8,
-	  "title_ja": "[タイトル]",
-	  "summary_ja": "[3行程度の日本語の要約文]",
-	  "comment": "[どうしてrkunが読むべき記事なのかの理由]"
-	}`
+記事を日本語で要約し、rkunが読む価値があるかについて1から10のスコアを付けてください。
+必ず以下のJSON形式のみで回答してください。他のテキストや説明は一切含めないでください。"
+
+{
+  "score": 8,
+  "title_ja": "[タイトル]",
+  "summary_ja": "[3行程度の日本語の要約文]",
+  "comment": "[どうしてrkunが読むべき記事なのかの理由]"
+}`
 
 	userContent := fmt.Sprintf("Title: %s\n\nContent: %s", entry.Title, entry.Content)
 
@@ -227,29 +237,60 @@ func processArticleWithLLM(entry MinifluxEntry) {
 
 	reqBody, _ := json.Marshal(llmReq)
 
-	// 1. ローカルLLMサーバーへポスト
-	resp, err := http.Post(LLMServerURL, "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		log.Printf("LLM Server Error: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	var llmResp LLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		log.Printf("Failed to decode LLM response: %v", err)
-		return
-	}
-
-	// マークダウンの ```json を削るトリミング処理
-	rawJSON := llmResp.Choices[0].Message.Content
-	rawJSON = strings.TrimPrefix(rawJSON, "```json")
-	rawJSON = strings.TrimSuffix(rawJSON, "```")
-	rawJSON = strings.TrimSpace(rawJSON)
-
 	var output LLMOutput
-	if err := json.Unmarshal([]byte(rawJSON), &output); err != nil {
-		log.Printf("Failed to parse LLM Output JSON: %v", err)
+	var lastErr error
+
+	// リトライループ: LLMリクエスト〜JSONパースまでをリトライ
+	for i := 0; i <= LLMRetryCount; i++ {
+		if i > 0 {
+			log.Printf("LLMリクエスト リトライ %d/%d", i, LLMRetryCount)
+			time.Sleep(1 * time.Second)
+		}
+
+		// 1. ローカルLLMサーバーへポスト
+		resp, err := http.Post(LLMServerURL, "application/json", bytes.NewBuffer(reqBody))
+		if err != nil {
+			lastErr = fmt.Errorf("LLM Server Error: %w", err)
+			log.Printf("LLM Server Error (attempt %d/%d): %v", i, LLMRetryCount, err)
+			continue
+		}
+
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("Failed to read LLM response body: %w", readErr)
+			log.Printf("Failed to read LLM response body (attempt %d/%d): %v", i, LLMRetryCount, readErr)
+			continue
+		}
+
+		var llmResp LLMResponse
+		if decodeErr := json.Unmarshal(bodyBytes, &llmResp); decodeErr != nil {
+			lastErr = fmt.Errorf("Failed to decode LLM response: %w", decodeErr)
+			log.Printf("Failed to decode LLM response (attempt %d/%d): %v", i, LLMRetryCount, decodeErr)
+			log.Printf("LLM raw response (attempt %d/%d): %s", i, LLMRetryCount, string(bodyBytes))
+			continue
+		}
+
+		// マークダウンの ```json を削るトリミング処理
+		rawJSON := llmResp.Choices[0].Message.Content
+		rawJSON = strings.TrimPrefix(rawJSON, "```json")
+		rawJSON = strings.TrimSuffix(rawJSON, "```")
+		rawJSON = strings.TrimSpace(rawJSON)
+
+		if err := json.Unmarshal([]byte(rawJSON), &output); err != nil {
+			lastErr = fmt.Errorf("Failed to parse LLM Output JSON: %w", err)
+			log.Printf("Failed to parse LLM Output JSON (attempt %d/%d): %v", i, LLMRetryCount, err)
+			log.Printf("LLM raw response (attempt %d/%d): %s", i, LLMRetryCount, string(bodyBytes))
+			continue
+		}
+
+		// 成功
+		lastErr = nil
+		break
+	}
+
+	if lastErr != nil {
+		log.Printf("LLM処理がすべてのリトライに失敗しました: %v", lastErr)
 		return
 	}
 
@@ -352,6 +393,10 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("body: %+v", webhook)
 
+	// Minifluxに即座に応答を返す（タイムアウト防止）
+	w.WriteHeader(http.StatusAccepted)
+	w.Write([]byte(`{"status":"accepted"}`))
+
 	if webhook.EventType == "new_entries" {
 		for _, entry := range webhook.Entries {
 			// 無限ループ防止: スクリプト自身が書き込んだAIフィードの記事はスキップする
@@ -359,17 +404,16 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// ★ Goの本領発揮
-			go processArticleWithLLM(entry)
+			// チャネルに送信してシリアル処理（entryWorkerが逐次処理する）
+			entryChan <- entry
 		}
 	}
-
-	// Minifluxに即座に応答を返す（タイムアウト防止）
-	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(`{"status":"accepted"}`))
 }
 
 func main() {
+	// LLMリクエストをシリアルに処理するワーカーを起動
+	go entryWorker()
+
 	checkLatestEntryOnStart()
 	http.HandleFunc("/webhook", handleWebhook)
 	log.Println("Starting server on :8000...")
