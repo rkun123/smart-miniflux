@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 // ==========================================
@@ -35,7 +37,7 @@ var (
 	DigestTime = getEnv("DIGEST_TIME", "01:42")
 
 	// ダイジェストに含める記事の最低スコア
-	DigestScoreThreshold = 9
+	DigestScoreThreshold = 10
 
 	// LLMリクエストをシリアル化するためのチャネル
 	entryChan = make(chan MinifluxEntry, 100)
@@ -228,7 +230,7 @@ func processArticleWithLLM(entry MinifluxEntry) {
 {
   "score": 8,
   "title_ja": "[タイトル]",
-  "summary_ja": "[3行程度の日本語の要約文]",
+  "summary_ja": "[5行程度の日本語の要約文]",
   "comment": "[どうしてrkunが読むべき記事なのかの理由]"
 }`
 
@@ -483,20 +485,77 @@ func scoreFromTitle(title string) int {
 	return score
 }
 
+// AIフィード記事のContentから冒頭の要約(summary)と推薦コメント(comment)を抽出する
+func extractSummaryComment(content string) (summary, comment string) {
+	z := html.NewTokenizer(strings.NewReader(content))
+	var pending string // "summary" or "comment"（次の<p>タグに適用する）
+	var mode string
+	var buf []string
+
+	for {
+		tt := z.Next()
+		switch tt {
+		case html.ErrorToken:
+			return summary, comment
+		case html.TextToken:
+			txt := string(z.Text())
+			if pending == "" && mode == "" {
+				// <h3>の見出しテキストからモードを判定
+				if strings.Contains(txt, "要約") {
+					pending = "summary"
+				} else if strings.Contains(txt, "推薦") {
+					pending = "comment"
+				}
+			}
+			if mode != "" {
+				buf = append(buf, txt)
+			}
+		case html.StartTagToken:
+			tn, _ := z.TagName()
+			switch string(tn) {
+			case "p":
+				if pending != "" {
+					mode = pending
+					pending = ""
+					buf = buf[:0]
+				}
+			case "br":
+				// <p>内の改行表現
+				if mode != "" {
+					buf = append(buf, "\n")
+				}
+			}
+		case html.EndTagToken:
+			tn, _ := z.TagName()
+			if string(tn) == "p" && mode != "" {
+				text := strings.TrimSpace(strings.Join(buf, ""))
+				if mode == "summary" {
+					summary = text
+				} else if mode == "comment" {
+					comment = text
+				}
+				mode = ""
+			}
+		}
+	}
+}
+
 // LLMを使って直近の記事をニュース番組風の文面にまとめる
 func generateDigestDescription(entries []MinifluxEntry) (string, error) {
 	var list []string
 	for i, e := range entries {
-		list = append(list, fmt.Sprintf("%d. [スコア%d] %s\n%s", i+1, scoreFromTitle(e.Title), strings.TrimPrefix(e.Title, fmt.Sprintf("[★%d] ", scoreFromTitle(e.Title))), e.URL))
+		// 各記事は冒頭の要約と推薦コメントのみをLLMに渡す
+		summary, comment := extractSummaryComment(e.Content)
+		list = append(list, fmt.Sprintf("%d\nタイトル: %s\n要約: %s\nコメント: %s", i+1, e.Title, summary, comment))
 	}
 	articleList := strings.Join(list, "\n\n")
 
-	systemPrompt := `あなたは優秀なニュースキャスターです。"rkun"という人物に、今日の重要ニュースをニュース番組のように伝えます。
+	systemPrompt := `あなたは優秀なニュースキャスターです。今日の重要ニュースをニュース番組のように伝える原稿を作成してください。
 以下の指示に必ず従ってください。
+- 各ニュースについて一段落で、記事のタイトルと、その記事がなぜ重要なのかを要約して伝える原稿を作成する。
 - ニュース番組のアナウンサーのような、親しみやすく簡潔な日本語で作成する。
-- 記事のタイトルと、その記事がなぜ重要なのかを要約して伝える。
 - マークダウンや記号を使わず、プレーンテキストのみで出力する。
-- 全体の長さは1000文字以内に収める。`
+- 全体の長さは4000文字以内に収める。`
 
 	userContent := fmt.Sprintf("今日の番組で取り上げる記事のリストです。\n\n%s\n\nこれらをニュース番組風にまとめてください。", articleList)
 
@@ -537,7 +596,7 @@ func generateDigestDescription(entries []MinifluxEntry) (string, error) {
 
 	text := strings.TrimSpace(llmResp.Choices[0].Message.Content)
 	// 出力長の安全策として1000文字で切り詰める
-	const maxLen = 1000
+	const maxLen = 4000
 	if len(text) > maxLen {
 		text = text[:maxLen]
 	}
