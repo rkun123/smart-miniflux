@@ -26,6 +26,7 @@ var (
 
 	LLMServerURL   = getEnv("LLM_SERVER_URL", "http://192.168.0.14:8000/v1/chat/completions")
 	LLMModelName   = getEnv("LLM_MODEL_NAME", "Gemma-4-E2B-it")
+	LLMServerToken = getEnv("LLM_SERVER_TOKEN", "")
 	ScoreThreshold = getEnvInt("SCORE_THRESHOLD", 5)
 	LLMRetryCount  = getEnvInt("LLM_RETRY_COUNT", 2)
 	SystemPrompt   = getEnv("SYSTEM_PROMPT", `あなたは優秀なニュースキュレーターです。"rkun"という人物のためにニュースを選別して届けます。`)
@@ -248,7 +249,12 @@ func processArticleWithLLM(entry MinifluxEntry) {
 		}
 
 		// 1. ローカルLLMサーバーへポスト
-		resp, err := http.Post(LLMServerURL, "application/json", bytes.NewBuffer(reqBody))
+		req, _ := http.NewRequest("POST", LLMServerURL, bytes.NewBuffer(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		if LLMServerToken != "" {
+			req.Header.Set("Authorization", "Bearer "+LLMServerToken)
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("LLM Server Error: %w", err)
 			log.Printf("LLM Server Error (attempt %d/%d): %v", i, LLMRetryCount, err)
