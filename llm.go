@@ -12,27 +12,6 @@ import (
 )
 
 // ==========================================
-// 🧠 LLM推論＆記事処理コーディネーター
-// ==========================================
-func processArticleWithLLM(entry MinifluxEntry) {
-	log.Printf("Processing item: %s", entry.Title)
-
-	output, err := evaluateWithLLM(entry)
-	if err != nil {
-		log.Printf("LLM処理がすべてのリトライに失敗しました: %v", err)
-		return
-	}
-
-	log.Printf("▶ LLM Evaluation - Score: %d / Title: %s", output.Score, output.TitleJa)
-
-	// スコアが閾値以上なら新規インサート + Discord通知
-	if output.Score >= ScoreThreshold {
-		insertToMiniflux(entry, output)
-		sendDiscordNotification(entry, output)
-	}
-}
-
-// ==========================================
 // 🤖 ローカルLLMに記事を評価させる（リトライ込み）
 // ==========================================
 func evaluateWithLLM(entry MinifluxEntry) (LLMOutput, error) {
@@ -121,4 +100,67 @@ func evaluateWithLLM(entry MinifluxEntry) (LLMOutput, error) {
 	}
 
 	return output, lastErr
+}
+
+// LLMを使って直近の記事をニュース番組風の文面にまとめる
+func generateDigestDescription(entries []MinifluxEntry) (string, error) {
+	var list []string
+	for i, e := range entries {
+		// 各記事は冒頭の要約と推薦コメントのみをLLMに渡す
+		summary, comment := extractSummaryComment(e.Content)
+		list = append(list, fmt.Sprintf("%d\nタイトル: %s\n要約: %s\nコメント: %s", i+1, e.Title, summary, comment))
+	}
+	articleList := strings.Join(list, "\n\n")
+
+	systemPrompt := `あなたは優秀なニュースキャスターです。今日の重要ニュースをニュース番組のように伝える原稿を作成してください。
+以下の指示に必ず従ってください。
+- 各ニュースについて一段落で、記事のタイトルと、その記事がなぜ重要なのかを要約して伝える原稿を作成する。
+- ニュース番組のアナウンサーのような、親しみやすく簡潔な日本語で作成する。
+- マークダウンや記号を使わず、プレーンテキストのみで出力する。
+- 全体の長さは4000文字以内に収める。`
+
+	userContent := fmt.Sprintf("今日の番組で取り上げる記事のリストです。\n\n%s\n\nこれらをニュース番組風にまとめてください。", articleList)
+
+	llmReq := LLMRequest{
+		Model:       LLMModelName,
+		Temperature: 0.7,
+		Messages: []LLMMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userContent},
+		},
+	}
+	reqBody, _ := json.Marshal(llmReq)
+
+	req, _ := http.NewRequest("POST", LLMServerURL, bytes.NewBuffer(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	if LLMServerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+LLMServerToken)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("LLM Server Error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return "", fmt.Errorf("Failed to read LLM response body: %w", readErr)
+	}
+
+	var llmResp LLMResponse
+	if decodeErr := json.Unmarshal(bodyBytes, &llmResp); decodeErr != nil {
+		return "", fmt.Errorf("Failed to decode LLM response: %w", decodeErr)
+	}
+	if len(llmResp.Choices) == 0 {
+		return "", fmt.Errorf("LLM response has no choices")
+	}
+
+	text := strings.TrimSpace(llmResp.Choices[0].Message.Content)
+	// 出力長の安全策として1000文字で切り詰める
+	const maxLen = 4000
+	if len(text) > maxLen {
+		text = text[:maxLen]
+	}
+	return text, nil
 }
