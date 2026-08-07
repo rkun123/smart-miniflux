@@ -11,50 +11,6 @@ import (
 )
 
 // ==========================================
-// 🚀 起動時に最新1件をチェックする関数
-// ==========================================
-func checkLatestEntryOnStart() {
-	log.Printf("[StartCheck] フィードID: %d の最新1件をチェック中...", TargetFeedID)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	// 特定のフィードの記事一覧を、最新順(direction=desc)、1件だけ(limit=1)取得するAPI URL
-	url := fmt.Sprintf("%s/v1/feeds/%d/entries?direction=desc&limit=1", MinifluxURL, TargetFeedID)
-
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("X-Auth-Token", MinifluxAPIKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[StartCheck] Miniflux APIへの接続に失敗: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Minifluxの通常のエントリ一覧レスポンスをパースする構造体
-	var result struct {
-		Entries []MinifluxEntry `json:"entries"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Printf("[StartCheck] レスポンスのパースに失敗: %v", err)
-		return
-	}
-
-	if len(result.Entries) == 0 {
-		log.Println("[StartCheck] 対象フィードに記事が見つかりませんでした。")
-		return
-	}
-
-	latestEntry := result.Entries[0]
-	log.Printf("[StartCheck] 最新記事を発見: %s", latestEntry.Title)
-
-	// すでに処理済み（タイトルに [★ がついているなど）でなければ、LLM処理を走らせる
-	// ※ただし、今回は新規記事として別フィードに入れるので、元記事のタイトルに [★ はないはずですが安全のため
-	processArticleWithLLM(latestEntry)
-}
-
-// ==========================================
 // 📥 スコア閾値以上の記事をAIフィードへインサートする
 // ==========================================
 func insertToMiniflux(entry MinifluxEntry, output LLMOutput) {
@@ -99,4 +55,29 @@ func insertToMiniflux(entry MinifluxEntry, output LLMOutput) {
 	}
 	insResp.Body.Close()
 	log.Printf("成功: 新しい翻訳記事をインサートしました。")
+}
+
+func getFeedEntries(since time.Time) ([]MinifluxEntry, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	url := fmt.Sprintf("%s/v1/feeds/%d/entries?direction=desc&limit=200&published_after=%d",
+		MinifluxURL, AIFeedID, since.Unix())
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("X-Auth-Token", MinifluxAPIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("[Digest] Miniflux APIへの接続に失敗: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Entries []MinifluxEntry `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("[Digest] レスポンスのパースに失敗: %v", err)
+	}
+
+	return result.Entries, nil
 }

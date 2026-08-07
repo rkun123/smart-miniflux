@@ -23,6 +23,9 @@ var (
 	ScoreThreshold = getEnvInt("SCORE_THRESHOLD", 5)
 	LLMRetryCount  = getEnvInt("LLM_RETRY_COUNT", 2)
 	SystemPrompt   = getEnv("SYSTEM_PROMPT", `あなたは優秀なニュースキュレーターです。"rkun"という人物のためにニュースを選別して届けます。`)
+
+	DigestCron           = getEnv("DIGEST_CRON", "10 * * * *")
+	DigestScoreThreshold = getEnvInt64("DIGEST_SCORE_THRESHOLD", 8)
 )
 
 // ------------------------------------------

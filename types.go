@@ -11,11 +11,12 @@ type MinifluxWebhook struct {
 }
 
 type MinifluxEntry struct {
-	ID      int64  `json:"id"`
-	FeedID  int64  `json:"feed_id"`
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	URL     string `json:"url"`
+	ID          int64  `json:"id"`
+	FeedID      int64  `json:"feed_id"`
+	Title       string `json:"title"`
+	Content     string `json:"content"`
+	URL         string `json:"url"`
+	PublishedAt string `json:"published_at"`
 }
 
 // ローカルLLM（OpenAI互換）へのリクエスト/レスポンス構造
